@@ -1,0 +1,12 @@
+<ul>
+<% @event.each do |event| %>
+	<li>
+		<%= event.name %>
+	<%= link_to 'Show', event_path(event) %>
+	<%= link_to 'Edit', edit_event_path(event) %>
+	<%= button_to 'Delete', event_path(event), :method => :delete, :data =>{:confirm => "Are you sure?"} %>
+	</li>
+	<% end %>
+</ul>
+
+<%= link_to 'New Event', :controller=> 'events', :action => 'new' %>
