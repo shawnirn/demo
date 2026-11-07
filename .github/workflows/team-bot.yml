@@ -1,0 +1,219 @@
+# Team Bot：任務 → 內部自動分工 → 平行執行 → 匯總 → 回覆給使用者
+#
+# 用法：在 Issue 或 PR 留言，以 `/team` 開頭，後面接任務描述，例如：
+#   /team 幫我分析登入流程為什麼會變慢，並提出修正方案
+#
+# 需要：repo Secret `ANTHROPIC_API_KEY`
+# 選用：repo Variable `TEAM_BOT_MODEL`（指定模型，不設則用 CLI 預設）
+name: Team Bot
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: team-bot-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+env:
+  TEAM_BOT_MODEL: ${{ vars.TEAM_BOT_MODEL }}
+
+jobs:
+  # ① 分派：讀任務與程式碼庫，拆成 1～5 個可平行的子任務
+  plan:
+    if: >-
+      startsWith(github.event.comment.body, '/team') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      subtasks: ${{ steps.plan.outputs.subtasks }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Acknowledge (👀)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content=eyes > /dev/null
+
+      - name: Build task context
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ctx"
+          {
+            echo "## Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}"
+            echo
+            echo "${ISSUE_BODY}"
+            echo
+            echo "## 使用者交付的任務"
+            echo "${COMMENT_BODY#/team}"
+          } > "$RUNNER_TEMP/ctx/context.md"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: team-context
+          path: ${{ runner.temp }}/ctx/context.md
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Plan subtasks
+        id: plan
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          cat .github/team-bot/prompts/planner.md "$RUNNER_TEMP/ctx/context.md" \
+            | claude -p --output-format json ${TEAM_BOT_MODEL:+--model "$TEAM_BOT_MODEL"} \
+                --allowedTools "Read,Grep,Glob" --disallowedTools "Bash,Edit,Write,WebFetch,WebSearch" \
+            > "$RUNNER_TEMP/plan_raw.json" || echo '{"result":""}' > "$RUNNER_TEMP/plan_raw.json"
+          subtasks="$(ruby .github/team-bot/extract_plan.rb "$RUNNER_TEMP/plan_raw.json")"
+          echo "subtasks=${subtasks}" >> "$GITHUB_OUTPUT"
+          echo "### 分工計畫" >> "$GITHUB_STEP_SUMMARY"
+          echo "$subtasks" | jq -r '.[] | "- **\(.role)** · \(.title)"' >> "$GITHUB_STEP_SUMMARY"
+
+  # ② 分工：每個子任務由一個專職 bot 平行處理（唯讀）
+  work:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        task: ${{ fromJSON(needs.plan.outputs.subtasks) }}
+    name: work (${{ matrix.task.role }} · ${{ matrix.task.id }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: team-context
+          path: ${{ runner.temp }}/ctx
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run subtask
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TASK_JSON: ${{ toJSON(matrix.task) }}
+          TASK_ID: ${{ matrix.task.id }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          out="$RUNNER_TEMP/out/${TASK_ID}.md"
+          {
+            cat .github/team-bot/prompts/worker.md
+            echo "## 你的角色：$(jq -r .role <<<"$TASK_JSON")"
+            echo "## 子任務：$(jq -r .title <<<"$TASK_JSON")"
+            jq -r .instructions <<<"$TASK_JSON"
+            echo
+            echo "---"
+            echo "# 原始任務背景（僅供參考）"
+            cat "$RUNNER_TEMP/ctx/context.md"
+          } > "$RUNNER_TEMP/prompt.md"
+
+          if claude -p --output-format json ${TEAM_BOT_MODEL:+--model "$TEAM_BOT_MODEL"} \
+               --allowedTools "Read,Grep,Glob" --disallowedTools "Bash,Edit,Write,WebFetch,WebSearch" \
+               < "$RUNNER_TEMP/prompt.md" > "$RUNNER_TEMP/raw.json"; then
+            body="$(jq -r '.result // ""' "$RUNNER_TEMP/raw.json")"
+          else
+            body="⚠️ 此子任務執行失敗，無產出。"
+          fi
+          {
+            echo "### [$(jq -r .role <<<"$TASK_JSON")] $(jq -r .title <<<"$TASK_JSON")"
+            echo
+            echo "$body"
+          } > "$out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: team-result-${{ matrix.task.id }}
+          path: ${{ runner.temp }}/out/${{ matrix.task.id }}.md
+
+  # ③ 匯總：整合所有 bot 的產出，回覆給使用者
+  aggregate:
+    needs: [plan, work]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: team-context
+          path: ${{ runner.temp }}/ctx
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: team-result-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/results
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Aggregate results
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/results"
+          {
+            cat .github/team-bot/prompts/aggregator.md
+            echo "# 使用者任務"
+            cat "$RUNNER_TEMP/ctx/context.md"
+            echo
+            echo "# 各 bot 產出"
+            for f in "$RUNNER_TEMP"/results/*.md; do
+              [ -e "$f" ] || continue
+              cat "$f"; echo; echo "---"
+            done
+          } > "$RUNNER_TEMP/prompt.md"
+
+          if claude -p --output-format json ${TEAM_BOT_MODEL:+--model "$TEAM_BOT_MODEL"} \
+               --allowedTools "Read,Grep,Glob" --disallowedTools "Bash,Edit,Write,WebFetch,WebSearch" \
+               < "$RUNNER_TEMP/prompt.md" > "$RUNNER_TEMP/raw.json"; then
+            jq -r '.result // ""' "$RUNNER_TEMP/raw.json" > "$RUNNER_TEMP/final.md"
+          fi
+          # 彙整失敗時，退回直接附上各 bot 原始產出
+          if [ ! -s "$RUNNER_TEMP/final.md" ]; then
+            { echo "⚠️ 自動彙整失敗，以下為各 bot 原始產出："; echo
+              cat "$RUNNER_TEMP"/results/*.md 2>/dev/null || echo "（無產出）"; } > "$RUNNER_TEMP/final.md"
+          fi
+          {
+            echo
+            echo "---"
+            echo "_🤖 Team Bot · [執行紀錄](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})_"
+          } >> "$RUNNER_TEMP/final.md"
+
+      - name: Reply to user
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" \
+            --body-file "$RUNNER_TEMP/final.md"
+          gh api "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content=rocket > /dev/null
